@@ -1,0 +1,22 @@
+# Development overrides — use with: docker compose -f docker-compose.yml -f docker-compose.override.yml up
+# This file enables hot-reload for local development without rebuilding the image
+services:
+  sipmt:
+    build:
+      context: .
+      args:
+        BUILDKIT_INLINE_CACHE: 1
+    environment:
+      DEBUG: "True"
+      LOG_LEVEL: DEBUG
+    volumes:
+      # Hot-reload app code without rebuilding
+      - ./streamlit_app:/app/streamlit_app
+      - ./utils:/app/utils
+      - ./config.py:/app/config.py
+      - ./change_tracking:/app/change_tracking
+      - ./document_processing:/app/document_processing
+      - ./geospatial:/app/geospatial
+      - ./template_matching:/app/template_matching
+    # Streamlit debug mode with additional logging
+    command: streamlit run streamlit_app/app.py --logger.level=debug --client.showErrorDetails=true

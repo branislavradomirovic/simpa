@@ -1,0 +1,212 @@
+import sys
+from pathlib import Path
+
+# Ensure project root is on path when running: streamlit run streamlit_app/app.py
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import streamlit as st
+import streamlit.components.v1 as components
+import re
+import webbrowser
+from streamlit_app.i18n import enable_serbian_locale
+from config import Config
+from utils.logger import setup_logging
+from database.db_manager import DatabaseManager
+from geospatial.map_generator import MapGenerator
+from streamlit_app.components.sidebar import render_page_disclaimer, render_sidebar
+from streamlit_app.components.help_button import render_help_button
+
+# ── Bootstrap ──────────────────────────────────────────────────────────────
+enable_serbian_locale(st)
+Config.ensure_directories()
+setup_logging(Config.LOG_FILE, Config.LOG_LEVEL)
+
+st.set_page_config(
+    page_title=Config.APP_NAME,
+    page_icon="🌍",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# Auto-open the static landing HTML in the default browser once per session.
+# Uses a session flag to avoid repeated opens on Streamlit reruns.
+try:
+    assets_dir = Path(__file__).resolve().parent.parent / "landing_page_assets"
+    index_file = assets_dir / "index.html"
+    if index_file.exists() and "landing_opened" not in st.session_state:
+        try:
+            webbrowser.open_new_tab(index_file.resolve().as_uri())
+        except Exception:
+            pass
+        st.session_state.landing_opened = True
+except Exception:
+    # Fail silently if session state or file access is unavailable.
+    pass
+
+# Strongly hide Streamlit sidebar and UI chrome across versions so the app
+# starts with a clean canvas. This uses multiple selectors to cover DOM
+# differences between Streamlit releases and custom themes.
+# Render the sidebar and proceed to the interactive app UI
+render_sidebar()
+
+# ── Initialise database once per session ───────────────────────────────────
+@st.cache_resource
+def init_db():
+    db = DatabaseManager()
+    db.initialize()
+    return db
+
+try:
+    db = init_db()
+except Exception as exc:  # keep the app alive even if DB init fails (Cloud should still serve)
+    import traceback
+
+    tb = traceback.format_exc()
+    setup_logging(Config.LOG_FILE, Config.LOG_LEVEL)
+    logger = None
+    try:
+        import logging
+
+        logger = logging.getLogger("streamlit_app")
+        logger.error("Database initialization failed:\n%s", tb)
+    except Exception:
+        pass
+
+    st.error("Database initialization failed — falling back to local SQLite. Check logs for details.")
+    # Fallback: use local SQLite file to keep the app responsive in Cloud demos
+    db = DatabaseManager(db_path=Config.DATABASE_PATH)
+    try:
+        db.initialize()
+    except Exception:
+        # If even fallback initialization fails, create a minimal in-memory manager
+        st.warning("Fallback DB initialization also failed — using in-memory DB for now.")
+        db = DatabaseManager(db_path=":memory:")
+
+# ── Session state defaults ─────────────────────────────────────────────────
+if "org_id" not in st.session_state:
+    st.session_state.org_id = db.get_or_create_organisation("Default Organisation")
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+
+# ── Home page ──────────────────────────────────────────────────────────────
+col1, col2 = st.columns([14, 4])
+with col1:
+    st.title("🌍 SIPMT")
+with col2:
+    render_help_button("🏠 Početna")
+st.subheader("Analizator dokumenata socijalne inkluzije")
+
+st.markdown("""
+Dobrodošli u **SIPMT** — otpremite upitnike, politike, uputstva, formulare,
+izveštaje i monitoring dokumente, a sistem će izdvojiti strukturisane informacije,
+automatski popuniti šablone izveštaja i prikazati lokacije na interaktivnoj mapi.
+
+---
+""")
+
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    doc_count = db.fetchone("SELECT COUNT(*) AS n FROM documents") or {"n": 0}
+    st.metric("📄 Documents", doc_count["n"])
+
+with col2:
+    tmpl_count = db.fetchone("SELECT COUNT(*) AS n FROM report_templates") or {"n": 0}
+    st.metric("📋 Templates", tmpl_count["n"])
+
+with col3:
+    rpt_count = db.fetchone("SELECT COUNT(*) AS n FROM reports") or {"n": 0}
+    st.metric("📊 Reports", rpt_count["n"])
+
+with col4:
+    chg_count = db.fetchone("SELECT COUNT(*) AS n FROM document_changes") or {"n": 0}
+    st.metric("🔍 Detektovane izmene", chg_count["n"])
+
+st.markdown("---")
+
+# ── Scope map — prefer Policies, fallback to all geocoded documents ────────
+st.subheader("📍 Obuhvat dokumenata — geo lokacije")
+
+policy_locations = db.fetchall(
+    """
+    SELECT l.place_name, l.latitude, l.longitude,
+           l.location_type, l.context,
+           d.title AS document_title,
+           d.document_type
+    FROM   locations l
+    JOIN   documents d ON d.id = l.document_id
+    WHERE  d.organisation_id = ?
+      AND  d.document_type   = 'Policies'
+      AND  l.geocoded        = 1
+      AND  l.latitude        IS NOT NULL
+      AND  l.longitude       IS NOT NULL
+    """,
+    (st.session_state.org_id,),
+)
+
+all_geocoded_locations = db.fetchall(
+    """
+    SELECT l.place_name, l.latitude, l.longitude,
+           l.location_type, l.context,
+           d.title AS document_title,
+           d.document_type
+    FROM   locations l
+    JOIN   documents d ON d.id = l.document_id
+    WHERE  d.organisation_id = ?
+      AND  l.geocoded        = 1
+      AND  l.latitude        IS NOT NULL
+      AND  l.longitude       IS NOT NULL
+    """,
+    (st.session_state.org_id,),
+)
+
+scope_locations = policy_locations or all_geocoded_locations
+
+if policy_locations:
+    st.caption(
+        "Prikazane su geokodirane lokacije izdvojene iz dokumenata kategorije **Politike**."
+    )
+elif all_geocoded_locations:
+    location_mix = db.fetchall(
+        """
+        SELECT d.document_type, COUNT(*) AS count
+        FROM   locations l
+        JOIN   documents d ON d.id = l.document_id
+        WHERE  d.organisation_id = ?
+          AND  l.geocoded        = 1
+          AND  l.latitude        IS NOT NULL
+          AND  l.longitude       IS NOT NULL
+        GROUP  BY d.document_type
+        ORDER  BY count DESC, d.document_type
+        """,
+        (st.session_state.org_id,),
+    )
+    mix_label = ", ".join(f"{row['document_type']}: {row['count']}" for row in location_mix)
+    st.caption(
+        "Trenutno nema geokodiranih zapisa u dokumentima kategorije **Politike**, "
+        "pa kontrolna tabla prikazuje sve dostupne geokodirane lokacije iz dokumenata. "
+        f"Trenutna struktura: {mix_label}."
+    )
+else:
+    st.caption(
+        "Još nema sačuvanih geokodiranih lokacija dokumenata. Otpremite i obradite dokumente, "
+        "zatim koristite stranicu Mapa za izdvajanje i geokodiranje lokacija."
+    )
+
+if scope_locations:
+    try:
+        from streamlit_folium import st_folium
+        mapper = MapGenerator()
+        m = mapper.build_map(scope_locations)
+        if m:
+            st_folium(m, width='stretch', height=420)
+    except ImportError:
+        st.warning("Paket `streamlit-folium` nije instaliran. Pokrenite `pip install streamlit-folium`.")
+else:
+    st.info(
+        "Za trenutnu organizaciju još nisu dostupne geokodirane lokacije."
+    )
+
+st.markdown("---")
+st.info("Koristite navigaciju sa leve strane za prelazak između sekcija.")
+render_page_disclaimer()
